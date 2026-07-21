@@ -158,10 +158,97 @@
   // ── Shared sidecar store ────────────────────────────────────────────────
   // One fetch + immediate write-on-change for every <image-slot> on the
   // page. Reads via fetch() so viewing works anywhere the HTML and sidecar
-  // are served together; writes go through window.omelette.writeFile, which
-  // the host allowlists to *.state.json basenames only.
+  // are served together; writes go through the backend picked below.
   const subs = new Set();
   let slots = {};
+
+  // ── Storage backends ────────────────────────────────────────────────────
+  // The authoring host injects window.omelette.writeFile and persists to a
+  // real file, which the host allowlists to *.state.json basenames only.
+  // Served statically (GitHub Pages) there is no host, so fall back to
+  // IndexedDB — same serialized shape, so nothing downstream cares which
+  // one is live.
+  //
+  // IndexedDB rather than localStorage: a poster is a 150-300KB WebP, so
+  // ~20 of them exceed localStorage's ~5MB quota, and its synchronous API
+  // would block the main thread on every write.
+  const IDB_DB = 'anime-watchlist';
+  const IDB_STORE = 'kv';
+  const IDB_KEY = 'image-slots';
+
+  function idbOpen() {
+    return new Promise((resolve, reject) => {
+      if (!window.indexedDB) return reject(new Error('IndexedDB unavailable'));
+      let rq;
+      // Private-mode Firefox throws synchronously from open().
+      try { rq = window.indexedDB.open(IDB_DB, 1); } catch (e) { return reject(e); }
+      rq.onupgradeneeded = () => {
+        if (!rq.result.objectStoreNames.contains(IDB_STORE)) rq.result.createObjectStore(IDB_STORE);
+      };
+      rq.onsuccess = () => resolve(rq.result);
+      rq.onerror = () => reject(rq.error || new Error('IndexedDB open failed'));
+      rq.onblocked = () => reject(new Error('IndexedDB blocked by another tab'));
+    });
+  }
+
+  function idbTx(mode, fn) {
+    return idbOpen().then((db) => new Promise((resolve, reject) => {
+      const tx = db.transaction(IDB_STORE, mode);
+      const rq = fn(tx.objectStore(IDB_STORE));
+      // Surface the transaction error, not just the request error: a quota
+      // overflow aborts the tx and is the failure this store is most likely
+      // to hit, since posters are the largest thing written here.
+      tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
+      tx.oncomplete = () => { db.close(); resolve(rq && rq.result); };
+      tx.onerror = () => reject(tx.error || new Error('IndexedDB transaction failed'));
+    }));
+  }
+
+  const idbBackend = {
+    name: 'indexeddb',
+    read: () => idbTx('readonly', (s) => s.get(IDB_KEY)).then((v) => v || null),
+    write: (data) => idbTx('readwrite', (s) => s.put(data, IDB_KEY)),
+  };
+
+  const omeletteBackend = {
+    name: 'omelette',
+    // The host owns the file; load() already fetches it, so there is
+    // nothing extra to read here.
+    read: () => Promise.resolve(null),
+    write: (data) => Promise.resolve(window.omelette.writeFile(STATE_FILE, JSON.stringify(data))),
+  };
+
+  // Picked per call, never cached: the host may inject omelette.writeFile
+  // after first render (see connectedCallback), and when it is present it
+  // is authoritative.
+  function pickBackend() {
+    return (window.omelette && window.omelette.writeFile) ? omeletteBackend : idbBackend;
+  }
+
+  // Is there anywhere to persist to at all? False only where IndexedDB is
+  // absent and no host bridge exists, in which case the drop UI stays
+  // hidden rather than offering an edit that could never be kept.
+  function canPersist() {
+    return !!(window.omelette && window.omelette.writeFile) || !!window.indexedDB;
+  }
+
+  // The app owns edit mode and advertises it as data-aw-edit on <html>.
+  // Observing the attribute keeps the coupling to a single attribute name
+  // in each direction — no imports, no callback registry.
+  try {
+    new MutationObserver(() => subs.forEach((fn) => fn()))
+      .observe(document.documentElement, { attributes: true, attributeFilter: ['data-aw-edit'] });
+  } catch (e) {}
+
+  // Ask the browser to exempt this origin from eviction under storage
+  // pressure. Best-effort and fire-and-forget — Safari decides on its own
+  // heuristics and Chrome may prompt; neither outcome changes behaviour.
+  try {
+    if (navigator.storage && navigator.storage.persist && navigator.storage.persisted) {
+      navigator.storage.persisted().then((p) => { if (!p) return navigator.storage.persist(); });
+    }
+  } catch (e) {}
+
   // ids explicitly cleared before the sidecar fetch resolved — otherwise
   // the merge below can't tell "never set" from "just deleted" and would
   // resurrect the sidecar's stale value.
@@ -171,19 +258,29 @@
 
   function load() {
     if (loadP) return loadP;
-    loadP = fetch(STATE_FILE)
+    // Two layers, read concurrently. The committed sidecar is the base —
+    // a repo can ship one as defaults — and the local backend overlays it,
+    // so a drop on this device overrides a shipped default for that slot.
+    const sidecar = fetch(STATE_FILE)
       .then((r) => (r.ok ? r.json() : null))
-      .then((j) => {
-        // Merge: sidecar loses to any in-memory change that raced ahead of
-        // the fetch (drop or clear) so neither is clobbered by hydration.
-        if (j && typeof j === 'object') {
-          const merged = Object.assign({}, j, slots);
+      .catch(() => null);
+    const local = pickBackend().read().catch(() => null);
+    loadP = Promise.all([sidecar, local])
+      .then(([j, l]) => {
+        const base = Object.assign({},
+          (j && typeof j === 'object') ? j : null,
+          (l && typeof l === 'object') ? l : null);
+        // Merge: stored state loses to any in-memory change that raced
+        // ahead of the read (drop or clear) so neither is clobbered by
+        // hydration.
+        if (Object.keys(base).length) {
+          const merged = Object.assign({}, base, slots);
           // A framing-only write that raced ahead of hydration must not
-          // drop a user image that's only on disk — inherit u from the
-          // sidecar for any in-memory entry that lacks one.
+          // drop a user image that's only in storage — inherit u from the
+          // stored entry for any in-memory entry that lacks one.
           for (const k in slots) {
-            if (merged[k] && !merged[k].u && j[k]) {
-              merged[k].u = typeof j[k] === 'string' ? j[k] : j[k].u;
+            if (merged[k] && !merged[k].u && base[k]) {
+              merged[k].u = typeof base[k] === 'string' ? base[k] : base[k].u;
             }
           }
           for (const id of tombstones) delete merged[id];
@@ -215,17 +312,47 @@
   // cannot happen in an unloading document anyway).
   function flushNow() {
     if (!loaded) return;
-    const w = window.omelette && window.omelette.writeFile;
-    if (!w) return;
-    try { Promise.resolve(w(STATE_FILE, JSON.stringify(slots))).catch(() => {}); } catch (e) {}
+    try { Promise.resolve(pickBackend().write(slots)).catch(() => {}); } catch (e) {}
   }
+
+  // Last write failure, surfaced on every editable slot. A silent save
+  // failure is the exact defect this store was rewritten to remove: the
+  // user sees the poster on screen and has no way to know it was never
+  // committed, so failures must be loud.
+  let storeError = null;
+  // Which slot's change was in the failed write, so the message lands on the
+  // slot the user just acted on instead of on every slot at once.
+  let storeErrorId = null;
+  let pendingId = null;
+  function setStoreError(e) {
+    const msg = describeWriteError(e);
+    const id = msg ? pendingId : null;
+    const same = (msg && storeError) ? msg.short === storeError.short : msg === storeError;
+    if (same && storeErrorId === id) return;
+    storeError = msg;
+    storeErrorId = id;
+    if (msg) console.warn('<image-slot> could not save:', msg.full, e);
+    subs.forEach((fn) => fn());
+  }
+  // Two lengths: slots render as narrow thumbnails here, where a sentence
+  // wraps to four lines and hides the very poster it is reporting on, so the
+  // band shows `short` on one line and carries `full` as its tooltip.
+  function describeWriteError(e) {
+    if (!e) return null;
+    const name = e.name || '';
+    if (name === 'QuotaExceededError' || /quota/i.test(e.message || '')) {
+      return { short: 'Storage full', full: 'Out of storage — remove a poster and try again.' };
+    }
+    // Safari private browsing rejects IndexedDB writes outright.
+    return { short: 'Not saved', full: 'Could not save this poster on this device.' };
+  }
+
   function save() {
     if (saving) { saveDirty = true; return; }
-    const w = window.omelette && window.omelette.writeFile;
-    if (!w) return;
     saving = true;
-    Promise.resolve(w(STATE_FILE, JSON.stringify(slots)))
-      .catch(() => {})
+    let p;
+    try { p = Promise.resolve(pickBackend().write(slots)); } catch (e) { p = Promise.reject(e); }
+    p.then(() => setStoreError(null), setStoreError)
       .then(() => { saving = false; if (saveDirty) { saveDirty = false; save(); } });
   }
 
@@ -244,12 +371,43 @@
     if (!id) return;
     if (val) { slots[id] = val; tombstones.delete(id); }
     else { delete slots[id]; if (!loaded) tombstones.add(id); }
+    // Attribute whatever the next write reports back to this slot.
+    pendingId = id;
     subs.forEach((fn) => fn());
     // A drop is rare + high-value — write immediately so nav-away can't lose
     // it. Gate on the initial read so we don't overwrite a sidecar we haven't
     // merged yet; the merge in load() keeps this change once the read lands.
     if (loaded) save(); else load().then(save);
   }
+
+  // ── Backup bridge ───────────────────────────────────────────────────────
+  // The app's Backup/Import lives in index.html and has no access to this
+  // module's closure. Expose exactly the two operations it needs, so slot
+  // state can ride along in the backup file instead of being silently left
+  // behind on the device.
+  // Same guard as customElements.define below, and for the same reason: this
+  // file can be evaluated more than once, and only the first evaluation's
+  // element class is registered. Installing the API unconditionally would
+  // publish a later closure's `slots`, which no live element writes to —
+  // export() would read empty while drops persisted through the real one.
+  if (!customElements.get('image-slot')) window.imageSlots = {
+    // Whole slot map: dropped posters (u) and crop settings alike. Repo
+    // posters are referenced by path from data.json and are not in here, so
+    // a backup only carries bytes the user actually added.
+    export() { return JSON.parse(JSON.stringify(slots)); },
+    // Resolves once the write lands (or rejects), so Import can report a
+    // real outcome rather than assuming success.
+    import(obj) {
+      if (!obj || typeof obj !== 'object') return Promise.resolve();
+      slots = JSON.parse(JSON.stringify(obj));
+      tombstones.clear();
+      loaded = true;
+      subs.forEach((fn) => fn());
+      return Promise.resolve(pickBackend().write(slots))
+        .then(() => setStoreError(null), (e) => { setStoreError(e); throw e; });
+    },
+    ready() { return load(); },
+  };
 
   // ── Image downscale ─────────────────────────────────────────────────────
   // Encode through a canvas so the sidecar carries resized bytes, not the
@@ -266,7 +424,14 @@
       const canvas = document.createElement('canvas');
       canvas.width = w; canvas.height = h;
       canvas.getContext('2d').drawImage(bitmap, 0, 0, w, h);
-      return canvas.toDataURL('image/webp', 0.85);
+      // toDataURL falls back to PNG when the requested type is unsupported
+      // (WebP encode landed late on iOS Safari) and reports no error. PNG
+      // of a photo runs ~10x the bytes, which matters when the budget is a
+      // storage quota, so check what actually came back and re-encode as
+      // JPEG when WebP was not honoured.
+      const webp = canvas.toDataURL('image/webp', 0.85);
+      if (webp.startsWith('data:image/webp')) return webp;
+      return canvas.toDataURL('image/jpeg', 0.85);
     } finally {
       bitmap.close && bitmap.close();
     }
@@ -417,7 +582,20 @@
     '.attr-error svg{opacity:.55}' +
     '.attr-error .cap{max-width:92%;font-weight:500;letter-spacing:.01em}' +
     ':host([data-attribution-error]) .attr-error{display:flex}' +
-    ':host([data-attribution-error]) .ring{display:none}';
+    ':host([data-attribution-error]) .ring{display:none}' +
+    // Save failures ride a band across the bottom rather than .empty's
+    // prompt: .empty is display:none the moment a slot has an image, so a
+    // message parked in there would be invisible in exactly the case that
+    // matters — a poster on screen that was never actually persisted.
+    // A band, not a full cover, so the image stays visible underneath.
+    '.save-error{position:absolute;left:0;right:0;bottom:0;display:none;' +
+    '  padding:4px 6px;box-sizing:border-box;text-align:center;' +
+    '  background:#d6402f;color:#fff;user-select:none;' +
+    // One line, clipped: these slots render as ~60px-wide thumbnails, and a
+    // wrapping message grows the band until it covers the whole poster.
+    '  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;' +
+    '  font:10px/1.3 system-ui,-apple-system,sans-serif}' +
+    ':host([data-save-error]) .save-error{display:block}';
 
   const icon =
     '<svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
@@ -503,6 +681,7 @@
         '  <div class="attr-error" part="attribution-error">' + warnIcon +
         '    <div class="cap">This photo needs attribution</div></div>' +
         '  <div class="loading" part="loading"></div>' +
+        '  <div class="save-error" part="save-error"></div>' +
         '  <div class="ring" part="ring"></div>' +
         '</div>' +
         // Outside .frame, like .spill/.ctl — the frame's overflow:hidden +
@@ -528,6 +707,7 @@
       this._empty = root.querySelector('.empty');
       this._cap = root.querySelector('.cap');
       this._sub = root.querySelector('.sub');
+      this._saveError = root.querySelector('.save-error');
       this._spill = root.querySelector('.spill');
       this._ctl = root.querySelector('.ctl');
       this._credit = root.querySelector('.credit');
@@ -751,6 +931,13 @@
       // was attached.
       this._pagehide = () => { this._exitReframe(true); flushNow(); };
       window.addEventListener('pagehide', this._pagehide);
+      // pagehide is not enough when the backend is IndexedDB: the write is
+      // async and an unloading document won't run its callbacks, and iOS
+      // routinely kills a backgrounded home-screen app without firing
+      // pagehide at all. visibilitychange fires while the document is still
+      // alive, so commit there too — the write has time to land.
+      this._vis = () => { if (document.visibilityState === 'hidden') { this._exitReframe(true); flushNow(); } };
+      document.addEventListener('visibilitychange', this._vis);
       // Promote spill to the top layer, then keep it pinned over the frame:
       // scroll/resize cover the common cases, and a per-frame rect check
       // catches layout shifts that fire neither (an image above finishing
@@ -802,6 +989,10 @@
       if (this._pagehide) {
         window.removeEventListener('pagehide', this._pagehide);
         this._pagehide = null;
+      }
+      if (this._vis) {
+        document.removeEventListener('visibilitychange', this._vis);
+        this._vis = null;
       }
       try { this._spill.hidePopover(); } catch {}
       try { this._ctl.hidePopover(); } catch {}
@@ -1062,10 +1253,22 @@
       this._ring.style.borderRadius = mask ? '' : radius;
       this._ring.style.display = mask ? 'none' : '';
 
-      // Controls and reframe entry gate on this so share links stay read-only.
-      const editable = !!(window.omelette && window.omelette.writeFile);
+      // Controls and reframe entry gate on this so share links stay
+      // read-only. Two conditions: somewhere to persist to, and the app
+      // actually in edit mode. Statically hosted, IndexedDB satisfies the
+      // first for every visitor, so the edit-mode attribute is what keeps a
+      // plain visit read-only.
+      const editable = canPersist() && document.documentElement.hasAttribute('data-aw-edit');
       this.toggleAttribute('data-editable', editable);
       this._sub.style.display = editable ? '' : 'none';
+      // A failed write is reported on the slot itself, not just the console,
+      // so it cannot be mistaken for a save that worked. Only on the slot
+      // whose write failed — the condition is usually global (a full quota),
+      // and banding all 228 posters would bury the one the user just touched.
+      const failed = !!storeError && storeErrorId != null && storeErrorId === this.id;
+      this.toggleAttribute('data-save-error', failed);
+      this._saveError.textContent = failed ? storeError.short : '';
+      this._saveError.title = failed ? storeError.full : '';
 
       // Content. The sidecar is also writable by the agent's write_file
       // tool, so its value isn't guaranteed canvas-originated — only accept

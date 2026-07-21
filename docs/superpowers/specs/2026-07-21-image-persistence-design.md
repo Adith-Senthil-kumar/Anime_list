@@ -84,6 +84,19 @@ private browsing — surface inline on the affected slot and via `console.warn`.
 This is the defect class the whole change exists to fix, so silence is not an
 acceptable outcome for any failure path.
 
+The message cannot live in `.empty`: that block is `display:none` the moment a
+slot holds an image, which is precisely the failing case — a poster visible on
+screen that was never committed. It renders instead in a `.save-error` band
+across the bottom of the frame, driven by a `data-save-error` host attribute in
+the same idiom as the existing `.attr-error` overlay. A band rather than a full
+cover, so the image stays visible; one clipped line with the full sentence in
+`title`, because these slots render ~60px wide and a wrapping message grows
+until it hides the poster it is describing.
+
+The band shows only on the slot whose write failed, tracked by recording the id
+passed to `setSlot`. The underlying condition is usually global (a full quota),
+and banding all 228 posters at once would bury the one the user just touched.
+
 ### Edit gate
 
 The gate becomes "a writable backend exists **and** the app is in edit mode."
@@ -93,9 +106,14 @@ The gate becomes "a writable backend exists **and** the app is in edit mode."
 through the existing `subs` broadcast. One line of coupling on each side, no
 module imports.
 
-Reposition writes are debounced ~300ms, so drag-to-reframe does not issue an
-IndexedDB write per pointer event and does not depend on the unreliable
-`pagehide` flush.
+Reposition writes need no debounce: `_commitView()` fires once when reframe
+exits, not per pointer event, so writes are already infrequent.
+
+They do need a second commit point. `pagehide` alone is not enough once the
+backend is asynchronous — an unloading document never runs the callbacks, and
+iOS routinely kills a backgrounded home-screen app without firing `pagehide` at
+all. Committing on `visibilitychange` → hidden runs while the document is still
+alive, so the write has time to land.
 
 ### Backup format v2
 
@@ -109,7 +127,14 @@ together. Only user-dropped posters are embedded — the 271 repo posters remain
 path references, keeping backups proportional to what the user actually added.
 
 Export requires reading slot state from `image-slot.js`, so it exposes a narrow
-public API: `window.imageSlots.export()` and `window.imageSlots.import(obj)`.
+public API: `window.imageSlots.export()`, `.import(obj)`, and `.ready()`.
+
+That API must be installed under the same `!customElements.get('image-slot')`
+guard as the element definition. The file is evaluated more than once, and only
+the first evaluation's class is registered; installing the API unconditionally
+publishes a later closure's `slots`, which no live element ever writes to. The
+symptom is quiet and confusing — drops persist correctly through the real
+closure while `export()` reads empty, so backups come out missing every poster.
 
 ### WebP fallback
 
@@ -144,3 +169,10 @@ asserted:
 4. Round-trip a v2 backup through export and import.
 5. Import a legacy bare-array backup, confirm it still loads.
 6. Confirm the authoring host path still writes through `omelette` when present.
+
+Two cautions learned while running these. The service worker is cache-first, so
+it will serve a stale `image-slot.js` mid-session and make a fixed bug look
+unfixed; unregister it and clear caches before trusting a result. And assert on
+storage, not just on screen — the double-evaluation bug rendered a correct
+image from one closure while another reported an empty store, so a screenshot
+alone would have passed it.

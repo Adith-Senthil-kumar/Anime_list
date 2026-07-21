@@ -195,7 +195,13 @@ class Component extends DCLogic {
 
   persistData(d) { try { localStorage.setItem("aw_data_v1", JSON.stringify(d)); } catch (e) {} }
   saveAndSet(d) { this.persistData(d); this.setState({ data: d }); }
-  toggleEdit() { this.setState({ editMode: !this.state.editMode }); }
+  toggleEdit() {
+    const on = !this.state.editMode;
+    // image-slot.js observes this attribute to gate its own drop/reframe UI,
+    // so posters become editable exactly when the rest of the page does.
+    try { document.documentElement.toggleAttribute("data-aw-edit", on); } catch (e) {}
+    this.setState({ editMode: on });
+  }
   addFranchise() { this.saveAndSet([...(this.state.data || []), { franchise: "New Franchise", entries: [] }]); }
   deleteFranchise(fi) { this.saveAndSet((this.state.data || []).filter((_, i) => i !== fi)); }
   addEntry(fi) {
@@ -206,15 +212,22 @@ class Component extends DCLogic {
     this.saveAndSet(this.state.data.map((f, i) => i !== fi ? f : { ...f, entries: f.entries.filter((_, j) => j !== si) }));
   }
   resetEdits() {
-    if (typeof window !== "undefined" && !window.confirm("Discard all your edits and restore the original list?")) return;
+    if (typeof window !== "undefined" && !window.confirm("Discard all your edits, including posters you added, and restore the original list?")) return;
     try { localStorage.removeItem("aw_data_v1"); } catch (e) {}
-    if (typeof location !== "undefined") location.reload();
+    // Posters live in their own store, so clearing only the list would leave
+    // them stranded on entries the reset just restored.
+    const done = (window.imageSlots ? window.imageSlots.import({}).catch(() => {}) : Promise.resolve());
+    done.then(() => { if (typeof location !== "undefined") location.reload(); });
   }
   downloadCopy() {
     // Export a data backup. Edits already auto-save on this device; this file
     // is a portable backup / lets the list be regenerated later.
+    // v2 carries dropped posters alongside the text: they live in a separate
+    // store from the list, so a text-only backup would restore looking
+    // complete while quietly having dropped every poster the user added.
     try {
-      const json = JSON.stringify(this.state.data, null, 2);
+      const images = (window.imageSlots && window.imageSlots.export()) || {};
+      const json = JSON.stringify({ version: 2, data: this.state.data, images }, null, 2);
       const a = document.createElement("a");
       a.href = URL.createObjectURL(new Blob([json], { type: "application/json" }));
       a.download = "anime-watchlist-data.json";
@@ -232,7 +245,16 @@ class Component extends DCLogic {
         r.onload = () => {
           try {
             const d = JSON.parse(r.result);
+            // Pre-v2 backups are a bare array of franchises, so the shape
+            // itself identifies the version — old files keep restoring.
             if (Array.isArray(d)) this.saveAndSet(d);
+            else if (d && d.version === 2 && Array.isArray(d.data)) {
+              this.saveAndSet(d.data);
+              if (d.images && window.imageSlots) {
+                window.imageSlots.import(d.images)
+                  .catch((err) => window.alert("List restored, but posters could not be saved: " + (err && err.message || err)));
+              }
+            }
             else window.alert("That file doesn't look like a watchlist backup.");
           } catch (err) { window.alert("Could not read that file: " + err); }
         };
