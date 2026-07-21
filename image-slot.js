@@ -146,13 +146,10 @@
       return href;
     }
   };
-  // 2× a ~600px slot in a 1920-wide deck — retina-sharp without making the
-  // sidecar enormous. A 1200px WebP at q=0.85 is ~150-300KB.
-  const MAX_DIM = 1200;
-  // Raster formats only. SVG is excluded (can carry script; createImageBitmap
-  // on SVG blobs is inconsistent). GIF is excluded because the canvas
-  // re-encode keeps only the first frame, so an animated GIF would silently
-  // go still — better to reject than surprise.
+  // Raster formats only. SVG is excluded: it can carry script, and the bytes
+  // are now stored verbatim rather than laundered through a canvas, so the
+  // exclusion matters more than it used to. GIF is excluded because only its
+  // first frame would survive a reframe.
   const ACCEPT = ['image/png', 'image/jpeg', 'image/webp', 'image/avif'];
 
   // ── Shared sidecar store ────────────────────────────────────────────────
@@ -409,32 +406,37 @@
     ready() { return load(); },
   };
 
-  // ── Image downscale ─────────────────────────────────────────────────────
-  // Encode through a canvas so the sidecar carries resized bytes, not the
-  // raw upload. Longest side is capped at 2× the slot's rendered width
-  // (retina) and at MAX_DIM. WebP keeps alpha and is ~10× smaller than PNG
-  // for photos, so there's no need for per-image format picking.
-  async function toDataUrl(file, targetW) {
-    const bitmap = await createImageBitmap(file);
-    try {
-      const cap = Math.min(MAX_DIM, Math.max(1, Math.round(targetW * 2)) || MAX_DIM);
-      const scale = Math.min(1, cap / Math.max(bitmap.width, bitmap.height));
-      const w = Math.max(1, Math.round(bitmap.width * scale));
-      const h = Math.max(1, Math.round(bitmap.height * scale));
-      const canvas = document.createElement('canvas');
-      canvas.width = w; canvas.height = h;
-      canvas.getContext('2d').drawImage(bitmap, 0, 0, w, h);
-      // toDataURL falls back to PNG when the requested type is unsupported
-      // (WebP encode landed late on iOS Safari) and reports no error. PNG
-      // of a photo runs ~10x the bytes, which matters when the budget is a
-      // storage quota, so check what actually came back and re-encode as
-      // JPEG when WebP was not honoured.
-      const webp = canvas.toDataURL('image/webp', 0.85);
-      if (webp.startsWith('data:image/webp')) return webp;
-      return canvas.toDataURL('image/jpeg', 0.85);
-    } finally {
-      bitmap.close && bitmap.close();
-    }
+  // ── Image ingest ────────────────────────────────────────────────────────
+  // Store the uploaded file's own bytes, untouched. Any canvas round-trip is
+  // lossy twice over — it resamples to the canvas size and re-encodes — so
+  // the only way to keep full quality is not to re-encode at all.
+  //
+  // This deliberately drops the old downscale. It capped the longest side at
+  // 2x the slot's *rendered* width, and these slots render as ~84px
+  // thumbnails, so every upload was being crushed to ~168px and then
+  // re-encoded at q=0.85. The stored image is the source for reframing and
+  // for any larger rendering later, so it should stay at full resolution
+  // regardless of how small the current thumbnail happens to be.
+  //
+  // The cost is size: a phone photo lands as several MB of base64 rather
+  // than a couple hundred KB. That is the intended trade, and a quota
+  // overflow is now reported on the slot instead of failing silently.
+  function toDataUrl(file) {
+    return new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => {
+        const u = String(r.result || '');
+        // readAsDataURL derives the MIME from the File, which can be empty
+        // or wrong; the render path only accepts data:image/*, so pin it to
+        // the type already validated against ACCEPT.
+        if (/^data:image\//i.test(u)) return resolve(u);
+        const comma = u.indexOf(',');
+        if (comma < 0) return reject(new Error('Unreadable image data'));
+        resolve('data:' + file.type + ';base64,' + u.slice(comma + 1));
+      };
+      r.onerror = () => reject(r.error || new Error('Could not read that file'));
+      r.readAsDataURL(file);
+    });
   }
 
   // ── Custom element ──────────────────────────────────────────────────────
@@ -1068,8 +1070,7 @@
         this._swapGen = gen;
       }
       try {
-        const w = this.clientWidth || this.offsetWidth || MAX_DIM;
-        const url = await toDataUrl(file, w);
+        const url = await toDataUrl(file);
         if (gen !== this._gen) return;
         // Only exit reframe once the new image is in hand — a rejected type
         // or decode failure leaves the in-progress crop untouched.

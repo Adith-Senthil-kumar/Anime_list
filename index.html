@@ -3,6 +3,18 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+// Point support.js's CDN loader at the vendored copies. It reads this map
+// before falling back to unpkg (see cdnScriptFor), so it must be set before
+// support.js runs. Vendored so the app works offline: React is required to
+// render at all, and a CDN script is not something a service worker can
+// precache reliably. The two files are byte-identical to the unpkg builds —
+// their SHA-384 hashes match the SRI values support.js pins for them.
+window.__resources = {
+  "https://unpkg.com/react@18.3.1/umd/react.production.min.js": "vendor/react.production.min.js",
+  "https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js": "vendor/react-dom.production.min.js"
+};
+</script>
 <script src="./support.js"></script>
 <link rel="manifest" href="manifest.webmanifest">
 <meta name="theme-color" content="#1c1712">
@@ -12,9 +24,11 @@
 <body>
 <x-dc>
 <helmet>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,600;12..96,700;12..96,800&family=DM+Mono:wght@400;500&family=Newsreader:ital,opsz,wght@0,6..72,400;0,6..72,500;1,6..72,400&display=swap" rel="stylesheet">
+<!-- Self-hosted rather than fonts.googleapis.com: the stylesheet and every
+     woff2 it pulls are cross-origin, so the service worker cannot precache
+     them and the app would fall back to system fonts offline. Same families,
+     same weights, generated from the Google CSS with the URLs rewritten. -->
+<link href="fonts/fonts.css" rel="stylesheet">
 <style>
   *{box-sizing:border-box}
   body{margin:0}
