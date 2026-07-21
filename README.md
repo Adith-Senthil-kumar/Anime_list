@@ -1,12 +1,12 @@
 # Anime Watchlist — installable web app
 
-A static site. Host it free on GitHub Pages and install it as an app.
+A static site, live on GitHub Pages and installable as an app.
 
-## Put it on GitHub Pages
-1. Create a new GitHub repository (e.g. `anime-watchlist`).
-2. Upload EVERYTHING in this folder to the repo (index.html, the .js files, data.json, manifest.webmanifest, sw.js, the icons, and the `images/` folder).
-3. Repo → Settings → Pages → Source: `main` branch, `/ (root)` → Save.
-4. After a minute your app is live at `https://<your-username>.github.io/anime-watchlist/`.
+**→ https://adith-senthil-kumar.github.io/Anime_list/**
+
+## Deployment
+Served by GitHub Pages from the `main` branch, `/ (root)`. Every push to `main`
+redeploys automatically — no build step, since it's plain HTML/JS.
 
 ## Install it as an app
 - **iPhone (Safari):** open the link → Share → Add to Home Screen.
@@ -17,3 +17,9 @@ Once opened online the first time, the service worker caches every poster, so it
 
 ## Editing
 Tap **Edit** in the app to change entries; edits save on that device. Use **Backup (.json)** / **Import** to move them between devices, or edit `data.json` in the repo directly.
+
+If you edit `data.json` (or any file) in the repo, also bump `CACHE` in `sw.js`
+— `anime-watchlist-v1` → `-v2`, etc. The service worker is cache-first, so
+anyone who has already opened the app keeps seeing the old copy until that
+version string changes. Bumping it purges the old cache and re-fetches
+everything on the next visit.
