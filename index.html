@@ -43,7 +43,12 @@ window.__resources = {
   .aw-tool--go:hover{background:#a82c1f}
   .aw-in{font-family:'DM Mono',monospace;font-size:16px;color:#1c1712;background:#fff;border:1px solid #ddd6c9;border-radius:6px;padding:10px 12px;width:100%}
   .aw-in:focus{outline:2px solid #d6402f;border-color:#d6402f}
-  @media print{.aw-toolbar{display:none!important}}
+  /* Back-to-top: same family as .aw-tool, but fixed bottom-right and only
+     present once the reader is deep in the list. Hidden state keeps
+     pointer-events off so it can't swallow taps while invisible. */
+  .aw-top{position:fixed;right:18px;bottom:18px;z-index:80;width:48px;height:48px;display:flex;align-items:center;justify-content:center;font-family:'DM Mono',monospace;font-size:20px;line-height:1;border:1px solid #1c1712;background:rgba(251,249,244,.92);backdrop-filter:blur(4px);color:#1c1712;border-radius:11px;cursor:pointer;box-shadow:0 2px 8px rgba(0,0,0,.18)}
+  .aw-top:hover{background:#1c1712;color:#fbf9f4}
+  @media print{.aw-toolbar,.aw-top{display:none!important}}
 </style>
 <script src="./doc-page.js"></script>
 <script src="./image-slot.js"></script>
@@ -423,6 +428,52 @@ class Component extends DCLogic {
     };
   }
 }
+</script>
+<script>
+// Back-to-top — self-healing on purpose. The template runtime can rebuild
+// body content after this runs, replacing the button with a clone; clones
+// keep attributes but lose listeners and closure identity. So no reference
+// is trusted: every update re-finds the live node, re-wires it if it is an
+// unwired clone (expandos do not survive cloning, which makes __awWired a
+// reliable detector), and re-applies inline visibility unconditionally.
+// Inline styles, not a [data-show] rule, because the sheet-driven hidden
+// state was verifiably defeated in testing while inline never is.
+(function () {
+  function wire(b) {
+    b.__awWired = true;
+    b.style.transition = "opacity .18s ease, transform .18s ease";
+    b.addEventListener("click", function () {
+      // Old Safari silently ignores the options object; fall back to instant.
+      if ("scrollBehavior" in document.documentElement.style) window.scrollTo({ top: 0, behavior: "smooth" });
+      else window.scrollTo(0, 0);
+    });
+  }
+  function ensure() {
+    var b = document.querySelector(".aw-top");
+    if (!b) {
+      b = document.createElement("button");
+      b.className = "aw-top"; b.type = "button";
+      b.title = "Back to top"; b.setAttribute("aria-label", "Back to top");
+      b.textContent = "\u2191";
+      wire(b);
+      b.style.opacity = "0"; b.style.transform = "translateY(8px)"; b.style.pointerEvents = "none";
+      document.body.appendChild(b);
+    } else if (!b.__awWired) {
+      wire(b);
+    }
+    return b;
+  }
+  function upd() {
+    var b = ensure();
+    var show = window.scrollY > 600;
+    b.style.opacity = show ? "1" : "0";
+    b.style.transform = show ? "none" : "translateY(8px)";
+    b.style.pointerEvents = show ? "auto" : "none";
+  }
+  window.addEventListener("scroll", upd, { passive: true });
+  window.addEventListener("load", upd);
+  upd();
+})();
 </script>
 </body>
 </html>
