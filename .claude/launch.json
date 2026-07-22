@@ -6,6 +6,18 @@
       "runtimeExecutable": "python3",
       "runtimeArgs": ["-m", "http.server", "8731"],
       "port": 8731
+    },
+    {
+      "name": "games-design-preview",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "8732", "--directory", "/Users/adiths/Personal video-game memory book"],
+      "port": 8732
+    },
+    {
+      "name": "game-vault",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "8733", "--directory", "/Users/adiths/List/Games-list"],
+      "port": 8733
     }
   ]
 }
